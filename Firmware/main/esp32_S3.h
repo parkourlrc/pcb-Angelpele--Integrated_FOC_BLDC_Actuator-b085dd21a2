@@ -106,6 +106,14 @@ enum DRV_MotionState {
     MOTION_RAMPING_DOWN
 };
 
+enum StatusFlags {
+    STATUS_OVERCURRENT = 1 << 0,
+    STATUS_OVERTEMP    = 1 << 1,
+    STATUS_UNDERVOLT   = 1 << 2,
+    STATUS_FAULT       = 1 << 3,
+    STATUS_OK          = 1 << 4
+};
+
 enum ControlMode {
     MODE_OPENLOOP_BEMF,     // trapezoidal open loop
     MODE_CLOSED_FOC,
@@ -115,7 +123,8 @@ enum ControlMode {
 enum ClosedMode {
     MODE_VEL,
     MODE_POS,
-    MODE_TORQUE
+    MODE_TORQUE,
+    MODE_IDLE
 };
 
 #pragma pack(push, 1)
@@ -151,22 +160,18 @@ typedef struct {
 #pragma pack(push, 1)
 typedef struct {
     uint8_t ID;
-    float pvdd;
-    float temp;
-    float red_angle;
-    float red_rpm;
-    uint8_t nfault;
-    uint8_t oc;
-} CANPacket;
+    uint8_t status;
+    uint8_t mode;
+    float value_fbk;
+} CANmotorPacket;
 #pragma pack(pop)
 
 #pragma pack(push, 1)
 typedef struct {
     uint8_t ID;
-    float pos;
-    float vel;
-    float torque;
-} MasterPacket;
+    uint8_t mode;
+    float value_cmd;
+} CANMasterPacket;
 #pragma pack(pop)
 
 typedef struct {

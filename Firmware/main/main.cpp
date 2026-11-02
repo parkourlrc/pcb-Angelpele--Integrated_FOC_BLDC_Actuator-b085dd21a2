@@ -23,8 +23,8 @@ HALL_SENSOR hall_sensor;
 angle_data fbk_pkg;
 BMI_data bmi_pkg;
 TelemetryPacket pkg;
-CANPacket slave_pkg;
-MasterPacket master_pkg;
+CANmotorPacket slave_pkg;
+CANMasterPacket master_pkg;
 
 SemaphoreHandle_t drv_mutex = NULL;
 SemaphoreHandle_t fbk_mutex = NULL;
@@ -44,15 +44,15 @@ void canLoop(void* arg);
 
 SystemState system_state = SYSTEM_INIT;
 DRV_MotionState motion = MOTION_IDLE;
-FeedbackSys fbk_sys = HALL;
+StatusFlags status_flags = STATUS_OK;
+FeedbackSys fbk_sys = MAG;  // Default to MAG feedback system
 ControlMode control_mode = MODE_CLOSED_FOC;
-ClosedMode closed_mode = MODE_VEL;
+ClosedMode closed_mode = MODE_POS;
 
-bool debug_mode_enabled = true;
+bool debug_mode_enabled = false;
 bool included_bmi = false;
 bool slave_motor = true;
-bool CAN_enabled = false;
-uint8_t motor_dest_id = 1; 
+bool CAN_enabled = true;
 uint8_t master_id = 0;
 
 extern "C" void app_main(void)
@@ -78,12 +78,13 @@ extern "C" void app_main(void)
                 gpio_set_pull_mode(CAN_TX, GPIO_PULLUP_ONLY); // GPIO43
 
                 if (initialize() == 0) {
-                    system_state = SYSTEM_CALIBRATION;
                     drv.set_override(true);
+                    system_state = SYSTEM_CALIBRATION;
                     mag.set_override(fbk_sys == MAG ? false : true);
                     bmi270.set_override(!included_bmi);
                 } else {
                     printf("Initialization failed, retrying...\n");
+                    status_flags = STATUS_UNDERVOLT;
                     vTaskDelay(pdMS_TO_TICKS(200));
                 }
                 break;
@@ -110,6 +111,7 @@ extern "C" void app_main(void)
             {;
                 esp_task_wdt_reset();
                 if (drv.fault_detection() == DRV_LATCHED) {
+                    status_flags = STATUS_FAULT;
                     printf("Critical fault detected. Driver disabled. Waiting for reset....\n");
                     fflush(stdout);
                     system_state = SYSTEM_INIT;
@@ -200,7 +202,6 @@ void controlLoop(void* arg){
         else if (fbk_sys == HALL) {
             local_angle = hall_sensor.getHallAngle();
             local_rpm = hall_sensor.getRPM(); // single call
-            drv.set_last_rpm(local_rpm);
             local_reducer_angle = local_angle;
 
             xSemaphoreTake(fbk_mutex, portMAX_DELAY);
@@ -298,49 +299,117 @@ void bmiLoop(void* arg) {
 }
 
 void canLoop(void* arg) {
-    //esp_task_wdt_add(NULL);
-    if(CAN_enabled){
-        while (true) {
-            if(slave_motor){
-                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-                DRV_data td;
-                angle_data tm;
-                BMI_data tb;
-                
-                if (xSemaphoreTake(drv_mutex, portMAX_DELAY) == pdTRUE) {
-                    td = drv.getdata();
-                    xSemaphoreGive(drv_mutex);
-                } if (xSemaphoreTake(fbk_mutex, portMAX_DELAY) == pdTRUE) {
-                    tm = fbk_pkg;
-                    xSemaphoreGive(fbk_mutex);
-                }
-                slave_pkg.ID = MOTOR_ID;
-                slave_pkg.pvdd = td.PVDD;
-                slave_pkg.temp = td.temperature;
-                slave_pkg.red_angle = tm.reducer_angle;
-                slave_pkg.red_rpm = drv.reducer_RPM(drv.get_last_rpm());
-                slave_pkg.nfault = td.NFAULT_raw;
-                slave_pkg.oc = td.NOCTW_raw;
-                
-                CAN_bus.sendData(slave_pkg, master_id);
-                CAN_bus.receiveData(&master_pkg, master_id);
-                drv.set_target_pos(master_pkg.pos);
-                drv.set_target_vel(master_pkg.vel);
-                drv.set_target_torque(master_pkg.torque);
-            }
-            else{
-                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-                master_pkg.ID = MOTOR_ID;
-                master_pkg.pos = 0.0f;
-                master_pkg.vel = 0.0f; 
-                master_pkg.torque = 0.0f; 
-                
-                CAN_bus.sendData(master_pkg, motor_dest_id);
-            }
-            //esp_task_wdt_reset();
+    if (!CAN_enabled) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t missed_rx_count = 0;
+    const uint32_t MAX_MISSED_RX = 20; 
+
+    while (true) {
+        // Wait for trigger notification (e.g., from timer or control loop)
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (!slave_motor) {
+            continue;
         }
-    } else {
-        vTaskDelete(NULL);          //Delete task if CAN not enabled
+
+        CAN_bus.check_and_recover();
+
+        DRV_data td = {};
+        angle_data tm = {};
+
+        if (xSemaphoreTake(drv_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            td = drv.getdata();
+            xSemaphoreGive(drv_mutex);
+        }
+        if (xSemaphoreTake(fbk_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            tm = fbk_pkg;
+            xSemaphoreGive(fbk_mutex);
+        }
+
+        // 3. Determine system health status
+        if (td.temperature < 0.0f || td.temperature > 50.0f) {
+            status_flags = STATUS_OVERTEMP;
+        } else if (td.PVDD < 14.0f) {
+            status_flags = STATUS_UNDERVOLT;
+        } else if (td.NFAULT_raw != 0) {
+            status_flags = STATUS_FAULT;
+        } else {
+            status_flags = STATUS_OK;
+        }
+
+        slave_pkg.ID = MOTOR_ID;
+        slave_pkg.status = static_cast<uint8_t>(status_flags);
+        slave_pkg.mode = static_cast<uint8_t>(closed_mode);
+
+        switch (closed_mode) {
+            case MODE_POS:
+                slave_pkg.value_fbk = tm.reducer_angle;
+                break;
+            case MODE_VEL:
+                slave_pkg.value_fbk = drv.reducer_RPM(drv.get_last_rpm());
+                break;
+            case MODE_TORQUE:
+                slave_pkg.value_fbk = 0.0f;
+                break;
+            default:
+                slave_pkg.value_fbk = 0.0f;
+                break;
+        }
+
+        if (!CAN_bus.sendData(slave_pkg, MOTOR_ID)) {
+            ESP_LOGW("CAN", "Failed to send CANmotorPacket feedback (Master possibly offline)");
+        }
+
+        CANMasterPacket incoming = {};
+        bool rx_ok = CAN_bus.receiveData(&incoming, master_id, pdMS_TO_TICKS(15));
+
+        if (rx_ok && incoming.ID == MOTOR_ID) {
+            missed_rx_count = 0; // Reset communication loss counter
+
+            const bool was_idle = (motion == MOTION_IDLE);
+            const ClosedMode prev_mode = closed_mode;
+
+            switch (incoming.mode) {
+                case MODE_IDLE:   
+                    motion = MOTION_IDLE;  
+                    break;
+                case MODE_POS:    
+                    drv.set_target_pos(incoming.value_cmd);    
+                    closed_mode = MODE_POS;    
+                    break;
+                case MODE_VEL:    
+                    drv.set_target_vel(incoming.value_cmd);    
+                    closed_mode = MODE_VEL;    
+                    break;
+                case MODE_TORQUE: 
+                    drv.set_target_torque(incoming.value_cmd); 
+                    closed_mode = MODE_TORQUE; 
+                    break;
+                default:
+                    ESP_LOGW("CAN", "Ignoring unknown command mode: %u", (unsigned)incoming.mode);
+                    break;
+            }
+
+            if (was_idle || closed_mode != prev_mode) {
+                drv.reset_spin_timer();
+                drv.reset_pos_loop();
+                drv.reset_vel_loop();
+                drv.reset_foc();
+                if (was_idle) motion = MOTION_STARTUP;
+            }
+        } else {
+                missed_rx_count++;
+            if (missed_rx_count >= MAX_MISSED_RX) {
+                // SAFETY: Stop motor if master comms lost
+                if (motion != MOTION_IDLE) {
+                    ESP_LOGW("CAN", "Master heartbeat lost. Entering IDLE.");
+                    motion = MOTION_IDLE;
+                }
+            }
+        }
     }
 }
 
@@ -436,8 +505,8 @@ void telemetryLoop(void* arg) {
                 }
                 else if (strcmp(cmd, "BRAKE") == 0) motion = MOTION_RAMPING_DOWN, drv.request_foc_stop();
                 else if (strcmp(cmd, "STOP") == 0) gpio_set_level(EN_DRV, 0);
-                else if (strncmp(cmd, "DUR:", 5) == 0) {
-                    float duration = atof(cmd + 5);
+                else if (strncmp(cmd, "DUR:", 4) == 0) {
+                    float duration = atof(cmd + 4);
                     drv.set_ramp_duration(duration);
                     printf("Ramp duration set to %.3f\n", duration);
                     fflush(stdout);

@@ -5,7 +5,9 @@
 #ifndef MCP2551_H
 #define MCP2551_H
 
-#include "ESP32_S3.h"
+#include "esp32_S3.h"
+#include <stddef.h>
+#include <stdint.h>
 
 
 #define CAN_Speed 1  //Mbps
@@ -13,6 +15,7 @@
 #define RX_TIMEOUT_MS 50
 #define TX_GAP_MS 2
 #define MAX_CAN_PACKET_SIZE 105
+#define CAN_RX_WAIT_MS 10
 
 
 class CAN {
@@ -22,7 +25,8 @@ class CAN {
         template <typename T>
         bool sendData(const T& data, uint8_t ID);
         template <typename R>
-        bool receiveData(R* packet, uint8_t expected_id);
+        bool receiveData(R* packet, uint8_t expected_id, TickType_t timeout = pdMS_TO_TICKS(CAN_RX_WAIT_MS));
+        void check_and_recover();
 
     private:
         void reset_rx_state();
